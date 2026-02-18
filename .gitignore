@@ -10,3 +10,8 @@ build/
 
 # Data files
 *.parquet
+
+# IDE files
+.vscode/
+.idea/
+.cursor/
