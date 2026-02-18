@@ -1,0 +1,1 @@
+// Placeholder: Shared TypeScript types

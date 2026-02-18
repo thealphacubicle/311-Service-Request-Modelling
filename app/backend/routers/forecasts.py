@@ -1,0 +1,1 @@
+# Placeholder: /forecasts endpoints
