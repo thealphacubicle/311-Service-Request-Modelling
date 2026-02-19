@@ -13,7 +13,6 @@ build/
 
 # Data files
 *.parquet
-data/processed/daily_features.csv
 
 # IDE files
 .vscode/
