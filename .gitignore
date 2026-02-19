@@ -8,8 +8,12 @@ __pycache__/
 dist/
 build/
 
+# Jupyter
+.ipynb_checkpoints/
+
 # Data files
 *.parquet
+data/processed/daily_features.csv
 
 # IDE files
 .vscode/
