@@ -18,3 +18,5 @@ build/
 .vscode/
 .idea/
 .cursor/
+
+.DS_Store
