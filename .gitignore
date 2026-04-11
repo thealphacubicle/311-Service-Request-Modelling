@@ -20,3 +20,17 @@ build/
 .cursor/
 
 .DS_Store
+.RData
+.RData.rdb
+.RData.rdb.*
+.RData.rdb.*.*
+.RData.rdb.*.*.*
+
+# R files
+*.Rproj
+*.Rproj.user
+*.Rproj.user.*
+*.Rproj.user.*.*
+# Don't commit .rds model files
+*.rds
+.Rhistory
