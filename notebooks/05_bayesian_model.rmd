@@ -1,0 +1,198 @@
+# Bayesian Linear Regression Modelling
+
+### Author: Srihari Raman
+
+## Load Data
+```{r}
+# Install dependencies
+if (!require("readr"))     install.packages("readr")
+if (!require("rprojroot")) install.packages("rprojroot")
+if (!require("dplyr"))     install.packages("dplyr")
+if (!require("nanoparquet"))     install.packages("nanoparquet")
+if (!require("ggplot2")) install.packages("ggplot2")
+install.packages("INLA",repos="https://inla.r-inla-download.org/R/stable")
+install.packages("fmesher")
+
+library(INLA)
+library(ggplot2)
+library(nanoparquet)
+library(rprojroot)
+library(dplyr)
+```
+
+```{r}
+# Find the root of the repo
+root <- find_root(has_file("pyproject.toml"))
+figures_dir <- file.path(root, "results", "figures") # to save plots for later
+tables_dir <- file.path(root, "results", "metrics") # to save tables
+models_dir <- file.path(root, "models") # to save serialized models for prediction time
+df <- read_parquet(file.path(root, "data", "processed", "bayesian_preprocessed_final.parquet"))
+
+# Normalize column types in case of disparity
+df <- df %>%
+  mutate(
+    neighborhood = as.factor(neighborhood),
+    month        = as.factor(month),
+    day_of_week  = as.factor(day_of_week),
+    year         = as.integer(year),
+    count        = as.integer(count)
+  )
+
+head(df)
+```
+
+```{r}
+# Checking dispersion
+dispersion <- df %>%
+  group_by(neighborhood) %>%
+  summarise(
+    mean_count   = mean(count),
+    var_count    = var(count),
+    dispersion   = var(count) / mean(count)
+  ) %>%
+  arrange(desc(dispersion))
+
+print(dispersion)
+cat("\nOverall dispersion:", var(df$count) / mean(df$count), "\n")
+
+write.csv(dispersion, file.path(tables_dir, "dispersion.csv"), row.names = FALSE)
+```
+
+**Analysis:** From this, we can confirm that there is a very large dispersion ratio across all neighborhoods in Boston, meaning that the variance of service requests is signficantly higher compared to the mean (both by neighborhood and in general). This confirms that we should use the negative binomial distribution as our likelihood.
+
+```{r}
+# Graph the distirbution of requests by neighborhood for prior dist values
+neighborhood_stats <- df %>%
+  group_by(neighborhood) %>%
+  summarise(
+    mean_count = mean(count),
+    sd_count   = sd(count)
+  ) %>%
+  arrange(desc(mean_count))
+
+print(neighborhood_stats)
+
+ggplot(neighborhood_stats, aes(x = mean_count, 
+                                y = reorder(neighborhood, mean_count))) +
+  geom_point() +
+  geom_errorbarh(aes(xmin = mean_count - sd_count, 
+                     xmax = mean_count + sd_count), height = 0.3) +
+  labs(title = "Mean daily requests per neighborhood (± 1 SD)",
+       x = "Mean requests / day", y = NULL) +
+  theme_minimal()
+
+ggsave(file.path(figures_dir, "mean_daily_requests_per_nbh.png"), width = 10, height = 6, dpi = 300)
+```
+
+**Analysis:** We can see that the means range from 13 - 104 requests (for Mission Hill and Dorchester respectively). Since we are modelling counts (with a support of discrete, non-negative values), we need to model log(counts) so we can use Normal priors. For the "intercept" value, we can see that the mean and spread of `log(104) - log(31)` is 3.5 and 1.0 respectively, so we can set the prior for the intercept to be \~ N(3.5, 1).
+
+```{r}
+# Check for seasonality
+# Monthly patterns
+p1 <- df %>%
+  group_by(month) %>%
+  summarise(mean_count = mean(count)) %>%
+  ggplot(aes(x = month, y = mean_count, group = 1)) +
+  geom_line() + geom_point() +
+  labs(title = "Mean daily requests by month", 
+       x = "Month", y = "Mean requests / day") +
+  theme_minimal()
+
+ggsave(file.path(figures_dir, "mean_daily_req_by_month.png"), width = 10, height = 6, dpi = 300)
+
+# Day of week pattern
+p2 <- df %>%
+  group_by(day_of_week) %>%
+  summarise(mean_count = mean(count)) %>%
+  ggplot(aes(x = day_of_week, y = mean_count, group = 1)) +
+  geom_line() + geom_point() +
+  labs(title = "Mean daily requests by day of week",
+       x = "Day of week (0=Mon, 6=Sun)", y = "Mean requests / day") +
+  theme_minimal()
+
+ggsave(file.path(figures_dir, "mean_daily_req_by_dayofweek.png"), width = 10, height = 6, dpi = 300)
+
+print(p1)
+print(p2)
+```
+
+**Analysis:** We can see a clear pattern in both the daily requests by day of week and by month. On a monthly basis, request volumes are low until about April, where it peaks during the summer months with September being the highest. Then, it suddenly drops in October and is at an all-time low in December. On a weekly aggregate, Monday - Friday has the highest request volume with the weekends being relatively quiet. So, we can set our prior for this weight to be \~ Normal(0,0.5).
+
+```{r}
+df %>%
+  group_by(year, month) %>%
+  summarise(mean_count = mean(count), .groups = "drop") %>%
+  ggplot(aes(x = month, y = mean_count, 
+             color = factor(year), group = factor(year))) +
+  geom_line() +
+  labs(title = "Mean daily requests by month, split by year",
+       x = "Month", y = "Mean requests / day", color = "Year") +
+  theme_minimal()
+
+ggsave(file.path(figures_dir, "mean_daily_req_by_month_split_year.png"), width = 10, height = 6, dpi = 300)
+```
+
+**Analysis:** We can see that 2020 (when COVID happened) is a clear outler compared to all the other years that tend to have the same trend (as we expected). The COVID-effect here is a one-off anomaly that we should incorporate as noise as part of the model. We can introduce a `is_COVID` flag to model that as a binary variable (so that we can still encode it's presence in the model).
+
+```{r}
+# Add the COVID flag to data (0 = not 2020, 1 = is 2020)
+df <- df %>%
+  mutate(is_covid = as.integer(year == 2020))
+
+head(df)
+```
+
+## Bayesian Linear Regression Model Training
+```{r}
+# Train on 2019-2023, test on 2024
+train <- df[df$year < 2024, ]   # if you still have year
+test  <- df[df$year == 2024, ]
+```
+
+```{r}
+# Combine train + test, set test counts to NA
+# INLA predicts wherever it sees NA in the response
+df_pred <- rbind(train, test)
+df_pred$count[nrow(train)+1:nrow(test)] <- NA
+
+fit_pred <- inla(
+  formula = count ~ month + day_of_week + is_covid +
+            f(neighborhood, model = "iid"),
+  data    = df_pred,
+  family  = "nbinomial",
+  control.fixed = list(
+    mean           = 0,
+    prec           = 1,
+    mean.intercept = 3.5,
+    prec.intercept = 1
+  ),
+  control.predictor = list(compute = TRUE, link = 1)
+)
+
+# Extract predictions for test rows
+predicted <- fit_pred$summary.fitted.values[
+  (nrow(train)+1):(nrow(train)+nrow(test)), "mean"
+]
+actual <- test$count
+
+# Serialize model
+saveRDS(fit_pred, file.path(models_dir, "inla_model.rds"))
+```
+
+```{r}
+# Run eval metrics
+# MAE — average absolute error
+mae <- mean(abs(predicted - actual))
+
+# RMSE — penalises large errors more
+rmse <- sqrt(mean((predicted - actual)^2))
+
+# MAPE — percentage error
+mape <- mean(abs((actual - predicted) / actual)) * 100
+
+cat("MAE: ",  round(mae,  2), "\n")
+cat("RMSE:",  round(rmse, 2), "\n")
+cat("MAPE:",  round(mape, 2), "%\n")
+```
+
+
