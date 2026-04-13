@@ -1,0 +1,5 @@
+"model_name","prior_beta_sd","prior_int_mean","family","iter","warmup","train_time_min","mae","rmse","mape","coverage","waic","loo_ic"
+"brms_beta0.5_int3.5_negbinomial_iter1000",0.5,3.5,"negbinomial",1000,500,14.02,10.57,15.53,34.69,94.78,246341.21,246341.42
+"brms_beta1.0_int3.0_negbinomial_iter1000",1,3,"negbinomial",1000,500,13.86,10.56,15.53,34.64,94.95,246339.08,246339.41
+"brms_beta1.0_int3.5_negbinomial_iter1000",1,3.5,"negbinomial",1000,500,12.24,10.58,15.54,34.69,94.76,246340.48,246340.78
+"brms_beta1.0_int3.5_poisson_iter1000",1,3.5,"poisson",1000,500,16.13,10.61,15.61,34.74,70.33,329063.27,329064.58

@@ -4,20 +4,16 @@
 
 ## Load Data
 ```{r}
-# Install dependencies
-if (!require("readr"))     install.packages("readr")
-if (!require("rprojroot")) install.packages("rprojroot")
-if (!require("dplyr"))     install.packages("dplyr")
-if (!require("nanoparquet"))     install.packages("nanoparquet")
-if (!require("ggplot2")) install.packages("ggplot2")
-install.packages("INLA",repos="https://inla.r-inla-download.org/R/stable")
-install.packages("fmesher")
+# Install dependencies if not installed already
+# install.packages(c("brms", "readr", "rprojroot", "dplyr", "nanoparquet", "ggplot2", "parallel"))
 
-library(INLA)
+
+library(brms)
 library(ggplot2)
 library(nanoparquet)
 library(rprojroot)
 library(dplyr)
+library(parallel)
 ```
 
 ```{r}
@@ -58,7 +54,7 @@ cat("\nOverall dispersion:", var(df$count) / mean(df$count), "\n")
 write.csv(dispersion, file.path(tables_dir, "dispersion.csv"), row.names = FALSE)
 ```
 
-**Analysis:** From this, we can confirm that there is a very large dispersion ratio across all neighborhoods in Boston, meaning that the variance of service requests is signficantly higher compared to the mean (both by neighborhood and in general). This confirms that we should use the negative binomial distribution as our likelihood.
+**Analysis:** From this, we can confirm that there is a very large dispersion ratio across all neighborhoods in Boston, meaning that the variance of service requests is signficantly higher compared to the mean (both by neighborhood and in general). This confirms that we should use the negative binomial distribution as our likelihood. Another model we can try is Poission (even though it probably won't work well since variance == mean for Poission distribution, and clearly that isn't the case).
 
 ```{r}
 # Graph the distirbution of requests by neighborhood for prior dist values
@@ -142,57 +138,150 @@ df <- df %>%
 head(df)
 ```
 
-## Bayesian Linear Regression Model Training
+## Bayesian Linear Regression Model Training (Using BRMS)
+**Notes:** We are using `grid` for grid search + parallel to parallelize the cores in the machine since the training loop takes ~27 minutes to run per iteration. Also, to preserve the time-based order, we will train on 2019-2023 and test on 2024 data.
 ```{r}
 # Train on 2019-2023, test on 2024
-train <- df[df$year < 2024, ]   # if you still have year
+train <- df[df$year < 2024, ]
 test  <- df[df$year == 2024, ]
 ```
 
 ```{r}
-# Combine train + test, set test counts to NA
-# INLA predicts wherever it sees NA in the response
-df_pred <- rbind(train, test)
-df_pred$count[nrow(train)+1:nrow(test)] <- NA
+# Set up Grid Search grid --> only testing 1 poisson type since we know it likely won't fit the data well
+ITERATIONS <- 1000
+WARMUP <- 500
+CHAINS <- 2
+CORES <- 4
 
-fit_pred <- inla(
-  formula = count ~ month + day_of_week + is_covid +
-            f(neighborhood, model = "iid"),
-  data    = df_pred,
-  family  = "nbinomial",
-  control.fixed = list(
-    mean           = 0,
-    prec           = 1,
-    mean.intercept = 3.5,
-    prec.intercept = 1
-  ),
-  control.predictor = list(compute = TRUE, link = 1)
+configs <- list(
+  list(prior_beta_sd = 1.0, prior_int_mean = 3.5, family = "negbinomial", iter = ITERATIONS, warmup = WARMUP),
+  list(prior_beta_sd = 0.5, prior_int_mean = 3.5, family = "negbinomial", iter = ITERATIONS, warmup = WARMUP),
+  list(prior_beta_sd = 1.0, prior_int_mean = 3.0, family = "negbinomial", iter = ITERATIONS, warmup = WARMUP),
+  list(prior_beta_sd = 1.0, prior_int_mean = 3.5, family = "poisson",     iter = ITERATIONS, warmup = WARMUP) 
 )
-
-# Extract predictions for test rows
-predicted <- fit_pred$summary.fitted.values[
-  (nrow(train)+1):(nrow(train)+nrow(test)), "mean"
-]
-actual <- test$count
-
-# Serialize model
-saveRDS(fit_pred, file.path(models_dir, "inla_model.rds"))
 ```
 
 ```{r}
-# Run eval metrics
-# MAE — average absolute error
-mae <- mean(abs(predicted - actual))
+results <- list()
 
-# RMSE — penalises large errors more
-rmse <- sqrt(mean((predicted - actual)^2))
+# For each model, fit and evaluate the model
+for (i in seq_along(configs)) {
+  cfg <- configs[[i]]
+  cat(sprintf("\n--- Config %d/%d ---\n", i, length(configs)))
+  print(cfg)
+  
+  # Model name based on configuration
+  model_name <- sprintf(
+    "brms_beta%.1f_int%.1f_%s_iter%d",
+    cfg$prior_beta_sd, cfg$prior_int_mean, cfg$family, cfg$iter
+  )
+  model_path <- file.path(models_dir, paste0(model_name, ".rds"))
+  
+  # Skip if model was already fit
+  if (file.exists(model_path)) {
+    cat("Already fitted, loading from disk...\n")
+    fit    <- readRDS(model_path)
+    timing <- NULL
+    
+  } else {
+    fam <- if (cfg$family == "negbinomial") negbinomial() else poisson()
+    
+    # Fit model if not already saved to disk
+    fit <- tryCatch({
+      timing <- system.time({
+        model <- brm(
+          formula = count ~ month + day_of_week + is_covid + (1 | neighborhood),
+          data    = train,
+          family  = fam,
+          prior   = c(
+            prior_string(paste0("normal(0, ", cfg$prior_beta_sd, ")"), class = "b"),
+            prior_string(paste0("normal(", cfg$prior_int_mean, ", 1)"), class = "Intercept")
+          ),
+          chains  = CHAINS,
+          iter    = cfg$iter,
+          warmup  = cfg$warmup,
+          cores   = CORES,
+          seed    = 42,
+          silent  = 2,
+          refresh = 0
+        )
+      })
+      cat(sprintf("Training time: %.1f minutes\n", timing["elapsed"] / 60))
+      model
+    }, error = function(e) {
+      cat("FAILED:", e$message, "\n")
+      return(NULL)
+    })
+    
+    if (!is.null(fit)) {
+      saveRDS(fit, model_path)
+      cat("Saved:", model_path, "\n")
+    }
+  }
+  
+  if (is.null(fit)) next
+  
+  # Predictions using posterior predictive distribution
+  pred_samples <- posterior_predict(fit, newdata = test)
+  predicted    <- colMeans(pred_samples)
+  actual       <- test$count
+  
+  # Standard regression metrics
+  mae      <- mean(abs(predicted - actual))
+  rmse     <- sqrt(mean((predicted - actual)^2))
+  mape     <- mean(abs((actual - predicted) / actual)) * 100
 
-# MAPE — percentage error
-mape <- mean(abs((actual - predicted) / actual)) * 100
-
-cat("MAE: ",  round(mae,  2), "\n")
-cat("RMSE:",  round(rmse, 2), "\n")
-cat("MAPE:",  round(mape, 2), "%\n")
+  
+  # Bayesian coverage — % of actuals within 95% credible interval
+  lower    <- apply(pred_samples, 2, quantile, 0.025)
+  upper    <- apply(pred_samples, 2, quantile, 0.975)
+  coverage <- mean(actual >= lower & actual <= upper) * 100
+  
+  # WAIC and LOO
+  waic_val <- tryCatch(waic(fit)$estimates["waic", "Estimate"], error = function(e) NA)
+  loo_val  <- tryCatch(loo(fit)$estimates["looic",  "Estimate"], error = function(e) NA)
+  
+  cat(sprintf("MAE:      %.2f\n",   mae))
+  cat(sprintf("RMSE:     %.2f\n",   rmse))
+  cat(sprintf("MAPE:     %.2f%%\n", mape))
+  cat(sprintf("Coverage: %.1f%% (95%% CI)\n", coverage))
+  cat(sprintf("WAIC:     %.2f\n",   waic_val))
+  cat(sprintf("LOO-IC:   %.2f\n",   loo_val))
+  
+  # Store results
+  results[[i]] <- data.frame(
+    model_name     = model_name,
+    prior_beta_sd  = cfg$prior_beta_sd,
+    prior_int_mean = cfg$prior_int_mean,
+    family         = cfg$family,
+    iter           = cfg$iter,
+    warmup         = cfg$warmup,
+    train_time_min = ifelse(is.null(timing), NA, round(timing["elapsed"] / 60, 2)),
+    mae            = round(mae,      2),
+    rmse           = round(rmse,     2),
+    mape           = round(mape,     2),
+    coverage       = round(coverage, 2),
+    waic           = round(waic_val, 2),
+    loo_ic         = round(loo_val,  2)
+  )
+}
 ```
+
+```{r}
+# Combine and save results table
+results_df <- do.call(rbind, results)
+results_df <- results_df[order(results_df$rmse), ]
+
+cat("\n=== Grid Search Results (sorted by RMSE) ===\n")
+print(results_df)
+
+write.csv(results_df, file.path(tables_dir, "brms_grid_search.csv"), row.names = FALSE)
+```
+
+**Notes:**
+1. When training, we serialized the model to save the state for future reference
+2. The models were trained on 2018-2023 data and used to generalize on the 2024 dataset
+3. To evaluate the model on the test set (2024), we captured standard regression metrics (i.e. MAE, RMSE) as well as Bayesian Regression-specific information criterion (WAIC, LOO)
+4. During evaluation, warnings kept showing up for WAIC stating that it could be unreliable, so LOO should be used to compare the models.
 
 

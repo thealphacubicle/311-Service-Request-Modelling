@@ -1,4 +1,6 @@
 import asyncio
+from pathlib import Path
+
 import httpx
 import pandas as pd
 
@@ -18,6 +20,8 @@ COLUMNS = (
 )
 
 sem = asyncio.Semaphore(3)  # max 3 concurrent requests to avoid rate limiting
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+PARQUET_PATH = PROJECT_ROOT / "data" / "raw" / "311_2019_2024.parquet"
 
 
 async def fetch_page(client, resource_id, year, offset, limit=10000):
@@ -58,18 +62,15 @@ async def fetch_all_years():
         dfs = await asyncio.gather(*tasks)
 
     combined = pd.concat(dfs, ignore_index=True)
-    combined.to_parquet("data/raw/311_2019_2024.parquet", index=False)
+    PARQUET_PATH.parent.mkdir(parents=True, exist_ok=True)
+    combined.to_parquet(PARQUET_PATH, index=False)
     print(f"\nDone. Total records: {len(combined)}")
     return combined
 
 
 if __name__ == "__main__":
-    import os
-
-    parquet_path = "data/raw/311_2019_2024.parquet"
-    if os.path.exists(parquet_path):
-        print(f"\nFile '{parquet_path}' already exists. Skipping download.\n")
-    else:
-        print(f"\nDownloading data to '{parquet_path}'...\n")
+    if not PARQUET_PATH.exists():
+        print(f"\nDownloading data to '{PARQUET_PATH}'...\n")
         asyncio.run(fetch_all_years())
-        print(f"\nDone. Total records: {len(combined)}")
+    else:
+        print(f"\nFile '{PARQUET_PATH}' already exists.\n")

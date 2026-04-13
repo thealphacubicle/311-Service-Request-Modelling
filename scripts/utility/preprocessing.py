@@ -1,20 +1,20 @@
 """
 preprocessing.py
 ----------------
-Unified preprocessing for Boston 311 Service Request data.
+Preprocessing for Boston 311 Service Request data.
 
 Produces outputs for two downstream models:
 
   Time Series outputs  (citywide + neighborhood aggregates)
-  ├── daily_total.parquet            – (date, count)
-  ├── daily_by_type.parquet          – wide pivot: date × request_type
-  ├── daily_by_neighborhood.parquet  – wide pivot: date × neighborhood
-  ├── weekly_total.parquet           – (week_start, count)
-  ├── weekly_by_type.parquet         – wide pivot: week_start × request_type
-  └── daily_features.parquet         – daily_total + lag/rolling features
+  ├── daily_total.parquet             (date, count)
+  ├── daily_by_type.parquet           (wide pivot: date by request_type)
+  ├── daily_by_neighborhood.parquet   (wide pivot: date by neighborhood)
+  ├── weekly_total.parquet            ((week_start, count)) 
+  ├── weekly_by_type.parquet          (wide pivot: week_start by request_type)
+  └── daily_features.parquet          (daily_total + lag/rolling features)
 
   Bayesian output
-  └── bayesian_preprocessed.parquet  – long format: (date, neighborhood, count)
+  └── bayesian_preprocessed.parquet   (long format: (date, neighborhood, count))
 
 Usage
 -----
@@ -24,7 +24,6 @@ Usage
 
 import os
 from pathlib import Path
-
 import pandas as pd
 
 
