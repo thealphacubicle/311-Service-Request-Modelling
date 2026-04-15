@@ -1,1 +1,0 @@
-// Placeholder: ForecastChart component

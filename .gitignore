@@ -19,6 +19,15 @@ build/
 .idea/
 .cursor/
 
+# Frontend (Next.js)
+app/frontend/node_modules/
+app/frontend/.next/
+app/frontend/.vercel/
+app/frontend/npm-debug.log*
+app/frontend/yarn-debug.log*
+app/frontend/yarn-error.log*
+app/frontend/pnpm-debug.log*
+
 .DS_Store
 .RData
 .RData.rdb
