@@ -1,45 +1,87 @@
-# Placeholder - add Python, R, Jupyter, data ignores as needed
-
-# Python
+# --- Python & uv ---
 .venv/
+venv/
+env/
+ENV/
 __pycache__/
 *.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
 *.egg-info/
+.eggs/
+pip-wheel-metadata/
 dist/
 build/
+.mypy_cache/
+.dmypy.json
+.pytest_cache/
+.ruff_cache/
+.tox/
+.nox/
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+*.cover
+.hypothesis/
 
 # Jupyter
 .ipynb_checkpoints/
+# Optional local Jupyter runtime/config (may contain tokens)
+.jupyter/
 
-# Data files
+# --- Data (local / large) ---
 *.parquet
 
-# IDE files
+# --- Environment & secrets ---
+.env
+.env.*
+!.env.example
+
+# --- Node / npm (any package root) ---
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+.pnpm-store/
+
+# --- Next.js ---
+.next/
+out/
+.vercel/
+*.tsbuildinfo
+
+# --- R & RStudio ---
+.Rhistory
+.Rapp.history
+.RData
+.Ruserdata
+*.Rout
+*.rds
+*.Rproj
+.Rproj.user/
+# renv: keep renv.lock & activate files; ignore local library
+renv/library/
+renv/python/
+renv/sandbox/
+renv/staging/
+# local R env vars (often secrets); remove if your team commits a template
+.Renviron
+.Renviron.*
+
+# packrat (legacy)
+packrat/lib*/
+packrat/src/
+
+# --- IDE / editors ---
 .vscode/
 .idea/
 .cursor/
 
-# Frontend (Next.js)
-app/frontend/node_modules/
-app/frontend/.next/
-app/frontend/.vercel/
-app/frontend/npm-debug.log*
-app/frontend/yarn-debug.log*
-app/frontend/yarn-error.log*
-app/frontend/pnpm-debug.log*
-
+# --- OS ---
 .DS_Store
-.RData
-.RData.rdb
-.RData.rdb.*
-.RData.rdb.*.*
-.RData.rdb.*.*.*
-
-# R files
-*.Rproj
-*.Rproj.user
-*.Rproj.user.*
-*.Rproj.user.*.*
-# Don't commit .rds model files
-*.rds
-.Rhistory
+Thumbs.db

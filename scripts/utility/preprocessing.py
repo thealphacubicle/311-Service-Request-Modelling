@@ -1,36 +1,9 @@
-"""
-preprocessing.py
-----------------
-Preprocessing for Boston 311 Service Request data.
-
-Produces outputs for two downstream models:
-
-  Time Series outputs  (citywide + neighborhood aggregates)
-  ├── daily_total.parquet             (date, count)
-  ├── daily_by_type.parquet           (wide pivot: date by request_type)
-  ├── daily_by_neighborhood.parquet   (wide pivot: date by neighborhood)
-  ├── weekly_total.parquet            ((week_start, count)) 
-  ├── weekly_by_type.parquet          (wide pivot: week_start by request_type)
-  └── daily_features.parquet          (daily_total + lag/rolling features)
-
-  Bayesian output
-  └── bayesian_preprocessed.parquet   (long format: (date, neighborhood, count))
-
-Usage
------
-    python preprocessing.py                         # uses default paths
-    RAW_DATA_PATH=... PROCESSED_DIR=... python preprocessing.py
-"""
-
 import os
 from pathlib import Path
 import pandas as pd
 
 
-# ---------------------------------------------------------------------------
 # Paths
-# ---------------------------------------------------------------------------
-
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_RAW = REPO_ROOT / "data" / "raw" / "311_2019_2024.parquet"
 DEFAULT_PROCESSED_DIR = REPO_ROOT / "data" / "processed"
@@ -39,17 +12,13 @@ RAW_DATA_PATH = Path(os.environ.get("RAW_DATA_PATH", DEFAULT_RAW))
 PROCESSED_DIR = Path(os.environ.get("PROCESSED_DIR", DEFAULT_PROCESSED_DIR))
 
 
-# ---------------------------------------------------------------------------
 # Constants
-# ---------------------------------------------------------------------------
-
-# Request types with fewer than this many records get bucketed into "Other"
 MIN_TYPE_COUNT = 1_000
 
 # Neighborhoods to drop entirely (city-wide catch-alls with no geographic meaning)
 DROP_NEIGHBORHOODS = {"Boston", "Chestnut Hill"}
 
-# Merge fragmented neighborhood labels into a single canonical name
+# Merge neighborhood labels into a single collective name
 NEIGHBORHOOD_MERGE_MAP = {
     "Allston": "Allston / Brighton",
     "Brighton": "Allston / Brighton",
@@ -58,30 +27,17 @@ NEIGHBORHOOD_MERGE_MAP = {
 }
 
 
-# ---------------------------------------------------------------------------
 # Step 1: Load & core cleaning  (shared by both models)
-# ---------------------------------------------------------------------------
-
 def load_and_clean(path: Path) -> pd.DataFrame:
     """
     Load the raw parquet and apply all cleaning that both models need:
-      - parse open_dt
-      - extract date/time features
-      - drop/fill missing neighborhoods
-      - merge duplicate neighborhood labels
-      - drop city-wide catch-alls
-      - bucket rare request types into "Other"
     """
-    print(f"Loading raw data from {path} ...")
+    print(f"Loading raw data from {path}")
     df = pd.read_parquet(path)
-    print(f"  Loaded {len(df):,} records")
 
-    # --- datetime parsing ---------------------------------------------------
+    # Parse datetime into proper Timestamp object
     df["open_dt"] = pd.to_datetime(df["open_dt"], errors="coerce")
-    # Use dt.normalize() so date is still a proper Timestamp (not a Python date
-    # object), which avoids the dtype=object bug in the original notebook.
     df["date"] = df["open_dt"].dt.normalize()
-
     df["year"]      = df["open_dt"].dt.year.astype("Int32")
     df["month"]     = df["open_dt"].dt.month.astype("Int32")
     df["day"]       = df["open_dt"].dt.day.astype("Int32")
@@ -92,37 +48,24 @@ def load_and_clean(path: Path) -> pd.DataFrame:
     df["latitude"]  = pd.to_numeric(df["latitude"],  errors="coerce")
     df["longitude"] = pd.to_numeric(df["longitude"], errors="coerce")
 
-    # --- neighborhood cleaning ----------------------------------------------
+    # Clean neighborhood column
     df["neighborhood"] = df["neighborhood"].str.strip()
 
-    # Drop rows with no usable neighborhood (null, empty string, or catch-alls)
+    # Drop rows with no usable neighborhood
     df = df[df["neighborhood"].notna()]
     df = df[df["neighborhood"] != ""]
-    df = df[~df["neighborhood"].isin(DROP_NEIGHBORHOODS)]
-
-    # Merge fragmented labels into canonical names
-    df["neighborhood"] = df["neighborhood"].replace(NEIGHBORHOOD_MERGE_MAP)
-
-    # Keep neighborhood_clean as an alias so downstream files that reference
-    # that column name (daily_by_neighborhood wide pivot, 311_cleaned) are
-    # byte-for-byte compatible with what the original notebook produced.
+    df = df[~df["neighborhood"].isin(DROP_NEIGHBORHOODS)] # Drop city-wide catch-alls
+    df["neighborhood"] = df["neighborhood"].replace(NEIGHBORHOOD_MERGE_MAP) # Merge fragmented labels into canonical names
     df["neighborhood_clean"] = df["neighborhood"]
 
-    # --- request type cleaning ----------------------------------------------
+    # Bucket rare request types into "Other"
     type_counts = df["type"].value_counts()
     rare_types  = type_counts[type_counts < MIN_TYPE_COUNT].index
     df["type_clean"] = df["type"].where(~df["type"].isin(rare_types), other="Other")
 
-    print(f"  After cleaning: {len(df):,} records")
-    print(f"  Neighborhoods : {df['neighborhood'].nunique()}")
-    print(f"  Request types : {df['type_clean'].nunique()} (after bucketing rare)")
     return df
 
-
-# ---------------------------------------------------------------------------
-# Step 2: Time series aggregations
-# ---------------------------------------------------------------------------
-
+# Time series aggreagtions (daily, weekly, by type, by neighborhood)
 def _full_date_range(df: pd.DataFrame, date_col: str = "date") -> pd.DatetimeIndex:
     return pd.date_range(df[date_col].min(), df[date_col].max(), freq="D")
 
@@ -141,7 +84,7 @@ def make_daily_total(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def make_daily_by_type(df: pd.DataFrame) -> pd.DataFrame:
-    """Wide pivot: date × request_type, no gaps."""
+    """Wide pivot: date by request_type"""
     long = df.groupby(["date", "type_clean"]).size().reset_index(name="count")
     wide = (
         long.pivot(index="date", columns="type_clean", values="count")
@@ -156,7 +99,7 @@ def make_daily_by_type(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def make_daily_by_neighborhood(df: pd.DataFrame) -> pd.DataFrame:
-    """Wide pivot: date x neighborhood_clean, no gaps.
+    """Wide pivot: date x neighborhood_clean
     Column names match the original notebook (neighborhood_clean as pivot axis).
     """
     long = df.groupby(["date", "neighborhood_clean"]).size().reset_index(name="count")
@@ -173,7 +116,7 @@ def make_daily_by_neighborhood(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def make_weekly_total(df: pd.DataFrame) -> pd.DataFrame:
-    """(week_start, count) — citywide weekly totals."""
+    """(week_start, count) for weekly totals"""
     df = df.copy()
     df["week_start"] = df["open_dt"] - pd.to_timedelta(df["open_dt"].dt.dayofweek, unit="d")
     df["week_start"] = df["week_start"].dt.normalize()
@@ -189,7 +132,7 @@ def make_weekly_total(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def make_weekly_by_type(df: pd.DataFrame) -> pd.DataFrame:
-    """Wide pivot: week_start × request_type."""
+    """Wide pivot: week_start by request_type."""
     df = df.copy()
     df["week_start"] = df["open_dt"] - pd.to_timedelta(df["open_dt"].dt.dayofweek, unit="d")
     df["week_start"] = df["week_start"].dt.normalize()
@@ -207,8 +150,7 @@ def make_weekly_by_type(df: pd.DataFrame) -> pd.DataFrame:
 
 def make_daily_features(daily_total: pd.DataFrame) -> pd.DataFrame:
     """
-    Enrich daily_total with calendar + lag + rolling features.
-    These are the input features for ML-style time series models.
+    Add calendar + lag + rolling features to daily_total
     """
     feat = daily_total.copy()
     feat = feat.sort_values("date").reset_index(drop=True)
@@ -247,9 +189,7 @@ def make_cleaned(df: pd.DataFrame) -> pd.DataFrame:
     ]].copy()
 
 
-# ---------------------------------------------------------------------------
-# Step 3: Bayesian aggregation
-# ---------------------------------------------------------------------------
+# Bayesian aggregation
 
 def make_bayesian_long(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -269,9 +209,7 @@ def make_bayesian_long(df: pd.DataFrame) -> pd.DataFrame:
     return long
 
 
-# ---------------------------------------------------------------------------
-# Step 4: Export
-# ---------------------------------------------------------------------------
+# Export
 
 def export(df: pd.DataFrame, name: str, out_dir: Path) -> None:
     path = out_dir / name
@@ -299,13 +237,10 @@ def run(raw_path: Path, out_dir: Path) -> None:
     export(make_cleaned(df),                 "311_cleaned.parquet",          out_dir)
 
     # -- bayesian output -----------------------------------------------------
-    print("\nBuilding Bayesian output ...")
     export(make_bayesian_long(df), "bayesian_preprocessed.parquet", out_dir)
 
-    print("\nDone. All outputs written to:", out_dir)
+    print("\nPreprocessing done")
 
-
-# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     if not RAW_DATA_PATH.exists():
