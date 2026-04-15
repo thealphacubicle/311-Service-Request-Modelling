@@ -1,0 +1,606 @@
+# Bayesian Linear Regression Modelling
+
+### Author: Srihari Raman
+
+## Load Data
+```{r}
+# Install dependencies if not installed already
+# install.packages(c("brms", "readr", "rprojroot", "dplyr", "nanoparquet", "ggplot2", "parallel"))
+
+
+library(brms)
+library(ggplot2)
+library(nanoparquet)
+library(rprojroot)
+library(dplyr)
+library(parallel)
+```
+
+```{r}
+# Find the root of the repo
+root <- find_root(has_file("pyproject.toml"))
+figures_dir <- file.path(root, "results", "figures") # to save plots for later
+tables_dir <- file.path(root, "results", "metrics") # to save tables
+models_dir <- file.path(root, "models") # to save serialized models for prediction time
+df <- read_parquet(file.path(root, "data", "processed", "bayesian_preprocessed_final.parquet"))
+
+# Normalize column types in case of disparity
+df <- df %>%
+  mutate(
+    neighborhood = as.factor(neighborhood),
+    month        = as.factor(month),
+    day_of_week  = as.factor(day_of_week),
+    year         = as.integer(year),
+    count        = as.integer(count)
+  )
+
+head(df)
+```
+
+```{r}
+# Checking dispersion
+dispersion <- df %>%
+  group_by(neighborhood) %>%
+  summarise(
+    mean_count   = mean(count),
+    var_count    = var(count),
+    dispersion   = var(count) / mean(count)
+  ) %>%
+  arrange(desc(dispersion))
+
+print(dispersion)
+cat("\nOverall dispersion:", var(df$count) / mean(df$count), "\n")
+
+write.csv(dispersion, file.path(tables_dir, "dispersion.csv"), row.names = FALSE)
+```
+
+**Analysis:** From this, we can confirm that there is a very large dispersion ratio across all neighborhoods in Boston, meaning that the variance of service requests is signficantly higher compared to the mean (both by neighborhood and in general). This confirms that we should use the negative binomial distribution as our likelihood. Another model we can try is Poission (even though it probably won't work well since variance == mean for Poission distribution, and clearly that isn't the case).
+
+```{r}
+# Graph the distirbution of requests by neighborhood for prior dist values
+neighborhood_stats <- df %>%
+  group_by(neighborhood) %>%
+  summarise(
+    mean_count = mean(count),
+    sd_count   = sd(count)
+  ) %>%
+  arrange(desc(mean_count))
+
+print(neighborhood_stats)
+
+ggplot(neighborhood_stats, aes(x = mean_count, 
+                                y = reorder(neighborhood, mean_count))) +
+  geom_point() +
+  geom_errorbarh(aes(xmin = mean_count - sd_count, 
+                     xmax = mean_count + sd_count), height = 0.3) +
+  labs(title = "Mean daily requests per neighborhood (± 1 SD)",
+       x = "Mean requests / day", y = NULL) +
+  theme_minimal()
+
+ggsave(file.path(figures_dir, "mean_daily_requests_per_nbh.png"), width = 10, height = 6, dpi = 300)
+```
+
+**Analysis:** We can see that the means range from 13 - 104 requests (for Mission Hill and Dorchester respectively). Since we are modelling counts (with a support of discrete, non-negative values), we need to model log(counts) so we can use Normal priors. For the "intercept" value, we can see that the mean and spread of `log(104) - log(31)` is 3.5 and 1.0 respectively, so we can set the prior for the intercept to be \~ N(3.5, 1).
+
+```{r}
+# Check for seasonality
+# Monthly patterns
+p1 <- df %>%
+  group_by(month) %>%
+  summarise(mean_count = mean(count)) %>%
+  ggplot(aes(x = month, y = mean_count, group = 1)) +
+  geom_line() + geom_point() +
+  labs(title = "Mean daily requests by month", 
+       x = "Month", y = "Mean requests / day") +
+  theme_minimal()
+
+ggsave(file.path(figures_dir, "mean_daily_req_by_month.png"), width = 10, height = 6, dpi = 300)
+
+# Day of week pattern
+p2 <- df %>%
+  group_by(day_of_week) %>%
+  summarise(mean_count = mean(count)) %>%
+  ggplot(aes(x = day_of_week, y = mean_count, group = 1)) +
+  geom_line() + geom_point() +
+  labs(title = "Mean daily requests by day of week",
+       x = "Day of week (0=Mon, 6=Sun)", y = "Mean requests / day") +
+  theme_minimal()
+
+ggsave(file.path(figures_dir, "mean_daily_req_by_dayofweek.png"), width = 10, height = 6, dpi = 300)
+
+print(p1)
+print(p2)
+```
+
+**Analysis:** We can see a clear pattern in both the daily requests by day of week and by month. On a monthly basis, request volumes are low until about April, where it peaks during the summer months with September being the highest. Then, it suddenly drops in October and is at an all-time low in December. On a weekly aggregate, Monday - Friday has the highest request volume with the weekends being relatively quiet. So, we can set our prior for this weight to be \~ Normal(0,0.5).
+
+```{r}
+df %>%
+  group_by(year, month) %>%
+  summarise(mean_count = mean(count), .groups = "drop") %>%
+  ggplot(aes(x = month, y = mean_count, 
+             color = factor(year), group = factor(year))) +
+  geom_line() +
+  labs(title = "Mean daily requests by month, split by year",
+       x = "Month", y = "Mean requests / day", color = "Year") +
+  theme_minimal()
+
+ggsave(file.path(figures_dir, "mean_daily_req_by_month_split_year.png"), width = 10, height = 6, dpi = 300)
+```
+
+**Analysis:** We can see that 2020 (when COVID happened) is a clear outler compared to all the other years that tend to have the same trend (as we expected). The COVID-effect here is a one-off anomaly that we should incorporate as noise as part of the model. We can introduce a `is_COVID` flag to model that as a binary variable (so that we can still encode it's presence in the model).
+
+```{r}
+# Add the COVID flag to data (0 = not 2020, 1 = is 2020)
+df <- df %>%
+  mutate(is_covid = as.integer(year == 2020))
+
+head(df)
+```
+
+## Bayesian Linear Regression Model Training (Using BRMS)
+**Notes:** We are using `grid` for grid search + parallel to parallelize the cores in the machine since the training loop takes ~27 minutes to run per iteration. Also, to preserve the time-based order, we will train on 2019-2023 and test on 2024 data.
+```{r}
+# Train on 2019-2023, test on 2024
+train <- df[df$year < 2024, ]
+test  <- df[df$year == 2024, ]
+```
+
+```{r}
+# Set up Grid Search grid --> only testing 1 poisson type since we know it likely won't fit the data well
+ITERATIONS <- 1000
+WARMUP <- 500
+CHAINS <- 2
+CORES <- 4
+TRAINING_VERSION <- "v1"
+
+configs <- list(
+  list(prior_beta_sd = 1.0, prior_int_mean = 3.5, family = "negbinomial", iter = ITERATIONS, warmup = WARMUP),
+  list(prior_beta_sd = 0.5, prior_int_mean = 3.5, family = "negbinomial", iter = ITERATIONS, warmup = WARMUP),
+  list(prior_beta_sd = 1.0, prior_int_mean = 3.0, family = "negbinomial", iter = ITERATIONS, warmup = WARMUP),
+  list(prior_beta_sd = 1.0, prior_int_mean = 3.5, family = "poisson",     iter = ITERATIONS, warmup = WARMUP) 
+)
+```
+
+```{r}
+results <- list()
+
+# For each model, fit and evaluate the model
+for (i in seq_along(configs)) {
+  cfg <- configs[[i]]
+  cat(sprintf("\n--- Config %d/%d ---\n", i, length(configs)))
+  print(cfg)
+  
+  # Model name based on configuration
+  model_name <- sprintf(
+    "brms_beta%.1f_int%.1f_%s_iter%d",
+    cfg$prior_beta_sd, cfg$prior_int_mean, cfg$family, cfg$iter
+  )
+  model_path <- file.path(models_dir, paste0(model_name, ".rds"))
+  
+  # Skip if model was already fit
+  if (file.exists(model_path)) {
+    cat("Already fitted, loading from disk...\n")
+    fit    <- readRDS(model_path)
+    timing <- NULL
+    
+  } else {
+    fam <- if (cfg$family == "negbinomial") negbinomial() else poisson()
+    
+    # Fit model if not already saved to disk
+    fit <- tryCatch({
+      timing <- system.time({
+        model <- brm(
+          formula = count ~ month + day_of_week + is_covid + (1 | neighborhood),
+          data    = train,
+          family  = fam,
+          prior   = c(
+            prior_string(paste0("normal(0, ", cfg$prior_beta_sd, ")"), class = "b"),
+            prior_string(paste0("normal(", cfg$prior_int_mean, ", 1)"), class = "Intercept")
+          ),
+          chains  = CHAINS,
+          iter    = cfg$iter,
+          warmup  = cfg$warmup,
+          cores   = CORES,
+          seed    = 42,
+          silent  = 2,
+          refresh = 0
+        )
+      })
+      cat(sprintf("Training time: %.1f minutes\n", timing["elapsed"] / 60))
+      model
+    }, error = function(e) {
+      cat("FAILED:", e$message, "\n")
+      return(NULL)
+    })
+    
+    if (!is.null(fit)) {
+      saveRDS(fit, model_path)
+      cat("Saved:", model_path, "\n")
+    }
+  }
+  
+  if (is.null(fit)) next
+  
+  # Predictions using posterior predictive distribution
+  pred_samples <- posterior_predict(fit, newdata = test)
+  predicted    <- colMeans(pred_samples)
+  actual       <- test$count
+  
+  # Standard regression metrics
+  mae      <- mean(abs(predicted - actual))
+  rmse     <- sqrt(mean((predicted - actual)^2))
+  mape     <- mean(abs((actual - predicted) / actual)) * 100
+
+  
+  # Bayesian coverage — % of actuals within 95% credible interval
+  lower    <- apply(pred_samples, 2, quantile, 0.025)
+  upper    <- apply(pred_samples, 2, quantile, 0.975)
+  coverage <- mean(actual >= lower & actual <= upper) * 100
+  
+  # WAIC and LOO
+  waic_val <- tryCatch(waic(fit)$estimates["waic", "Estimate"], error = function(e) NA)
+  loo_val  <- tryCatch(loo(fit)$estimates["looic",  "Estimate"], error = function(e) NA)
+  
+  cat(sprintf("MAE:      %.2f\n",   mae))
+  cat(sprintf("RMSE:     %.2f\n",   rmse))
+  cat(sprintf("MAPE:     %.2f%%\n", mape))
+  cat(sprintf("Coverage: %.1f%% (95%% CI)\n", coverage))
+  cat(sprintf("WAIC:     %.2f\n",   waic_val))
+  cat(sprintf("LOO-IC:   %.2f\n",   loo_val))
+  
+  # Store results
+  results[[i]] <- data.frame(
+    model_name     = model_name,
+    training_version = TRAINING_VERSION,
+    prior_beta_sd  = cfg$prior_beta_sd,
+    prior_int_mean = cfg$prior_int_mean,
+    family         = cfg$family,
+    iter           = cfg$iter,
+    warmup         = cfg$warmup,
+    train_time_min = ifelse(is.null(timing), NA, round(timing["elapsed"] / 60, 2)),
+    mae            = round(mae,      2),
+    rmse           = round(rmse,     2),
+    mape           = round(mape,     2),
+    coverage       = round(coverage, 2),
+    waic           = round(waic_val, 2),
+    loo_ic         = round(loo_val,  2)
+  )
+}
+```
+
+```{r}
+# Combine and save results table
+results_df <- do.call(rbind, results)
+results_df <- results_df[order(results_df$rmse), ]
+
+cat("\n=== Grid Search Results (sorted by RMSE) ===\n")
+print(results_df)
+
+write.csv(results_df, file.path(tables_dir, "brms_grid_search_v1.csv"), row.names = FALSE)
+```
+
+**Notes:**
+1. When training, we serialized the model to save the state for future reference
+2. The models were trained on 2018-2023 data and used to generalize on the 2024 dataset
+3. To evaluate the model on the test set (2024), we captured standard regression metrics (i.e. MAE, RMSE) as well as Bayesian Regression-specific information criterion (WAIC, LOO)
+4. During evaluation, warnings kept showing up for WAIC stating that it could be unreliable, so LOO should be used to compare the models.
+
+### Training Additional Models with Lag Terms Added (V1)
+```{r}
+# Re-load data if offline
+root <- find_root(has_file("pyproject.toml"))
+figures_dir <- file.path(root, "results", "figures") # to save plots for later
+tables_dir <- file.path(root, "results", "metrics") # to save tables
+models_dir <- file.path(root, "models") # to save serialized models for prediction time
+
+df <- read_parquet(file.path(root, "data", "processed", "bayesian_preprocessed_final.parquet"))
+head(df)
+```
+```{r}
+# Added feature engineering:
+
+# 1. Add lag features (1 day lag, 1 week lag, 1 month lag)
+df <- df %>%
+  arrange(neighborhood, year, month, day_of_week) %>%
+  group_by(neighborhood) %>%
+  mutate(
+    count_lag1  = lag(count, 1),    # yesterday
+    count_lag7  = lag(count, 7),    # same day last week
+  ) %>%
+  ungroup() %>%
+  # Drop rows where lags are NA (first 7 rows per neighborhood)
+  filter(!is.na(count_lag7))
+
+# 2. Bring back covid column
+df <- df %>%
+  mutate(is_covid = as.integer(year == 2020))
+
+head(df)
+```
+
+```{r}
+# Same training configs as before (written again if training offline from before)
+train <- df[df$year < 2024, ]
+test  <- df[df$year == 2024, ]
+
+ITERATIONS <- 1000
+WARMUP <- 500
+CHAINS <- 2
+CORES <- 4
+TRAINING_VERSION <- "v2"
+
+configs <- list(
+  list(prior_beta_sd = 1.0, prior_int_mean = 3.5, family = "negbinomial", iter = ITERATIONS, warmup = WARMUP),
+  list(prior_beta_sd = 0.5, prior_int_mean = 3.5, family = "negbinomial", iter = ITERATIONS, warmup = WARMUP),
+  list(prior_beta_sd = 1.0, prior_int_mean = 3.0, family = "negbinomial", iter = ITERATIONS, warmup = WARMUP),
+  list(prior_beta_sd = 1.0, prior_int_mean = 3.5, family = "poisson",     iter = ITERATIONS, warmup = WARMUP) 
+)
+```
+
+```{r}
+results <- list()
+
+# For each model, fit and evaluate the model
+for (i in seq_along(configs)) {
+  cfg <- configs[[i]]
+  cat(sprintf("\n--- Config %d/%d ---\n", i, length(configs)))
+  print(cfg)
+  
+  # Model name based on configuration
+  model_name <- sprintf(
+  "brms_beta%.1f_int%.1f_%s_iter%d_%s",
+  cfg$prior_beta_sd, cfg$prior_int_mean, cfg$family, cfg$iter, TRAINING_VERSION)
+  model_path <- file.path(models_dir, paste0(model_name, ".rds"))
+  
+  # Skip if model was already fit
+  if (file.exists(model_path)) {
+    cat("Already fitted, loading from disk...\n")
+    fit    <- readRDS(model_path)
+    timing <- NULL
+    
+  } else {
+    fam <- if (cfg$family == "negbinomial") negbinomial() else poisson()
+    
+    # Fit model if not already saved to disk
+    fit <- tryCatch({
+      timing <- system.time({
+        model <- brm(
+          formula = count ~ month + day_of_week + is_covid + count_lag1 + count_lag7 + (1 | neighborhood),
+          data    = train,
+          family  = fam,
+          prior   = c(
+            prior_string(paste0("normal(0, ", cfg$prior_beta_sd, ")"), class = "b"),
+            prior_string(paste0("normal(", cfg$prior_int_mean, ", 1)"), class = "Intercept")
+          ),
+          chains  = CHAINS,
+          iter    = cfg$iter,
+          warmup  = cfg$warmup,
+          cores   = CORES,
+          seed    = 42,
+          silent  = 2,
+          refresh = 0
+        )
+      })
+      cat(sprintf("Training time: %.1f minutes\n", timing["elapsed"] / 60))
+      model
+    }, error = function(e) {
+      cat("FAILED:", e$message, "\n")
+      return(NULL)
+    })
+    
+    if (!is.null(fit)) {
+      saveRDS(fit, model_path)
+      cat("Saved:", model_path, "\n")
+    }
+  }
+  
+  if (is.null(fit)) next
+  
+  # Predictions using posterior predictive distribution
+  pred_samples <- posterior_predict(fit, newdata = test)
+  predicted    <- colMeans(pred_samples)
+  actual       <- test$count
+  
+  # Standard regression metrics
+  mae      <- mean(abs(predicted - actual))
+  rmse     <- sqrt(mean((predicted - actual)^2))
+  mape     <- mean(abs((actual - predicted) / actual)) * 100
+
+  
+  # Bayesian coverage — % of actuals within 95% credible interval
+  lower    <- apply(pred_samples, 2, quantile, 0.025)
+  upper    <- apply(pred_samples, 2, quantile, 0.975)
+  coverage <- mean(actual >= lower & actual <= upper) * 100
+  
+  # WAIC and LOO
+  waic_val <- tryCatch(waic(fit)$estimates["waic", "Estimate"], error = function(e) NA)
+  loo_val  <- tryCatch(loo(fit)$estimates["looic",  "Estimate"], error = function(e) NA)
+  
+  cat(sprintf("MAE:      %.2f\n",   mae))
+  cat(sprintf("RMSE:     %.2f\n",   rmse))
+  cat(sprintf("MAPE:     %.2f%%\n", mape))
+  cat(sprintf("Coverage: %.1f%% (95%% CI)\n", coverage))
+  cat(sprintf("WAIC:     %.2f\n",   waic_val))
+  cat(sprintf("LOO-IC:   %.2f\n",   loo_val))
+  
+  # Store results
+  results[[i]] <- data.frame(
+    model_name     = model_name,
+    prior_beta_sd  = cfg$prior_beta_sd,
+    prior_int_mean = cfg$prior_int_mean,
+    family         = cfg$family,
+    iter           = cfg$iter,
+    warmup         = cfg$warmup,
+    train_time_min = ifelse(is.null(timing), NA, round(timing["elapsed"] / 60, 2)),
+    mae            = round(mae,      2),
+    rmse           = round(rmse,     2),
+    mape           = round(mape,     2),
+    coverage       = round(coverage, 2),
+    waic           = round(waic_val, 2),
+    loo_ic         = round(loo_val,  2)
+  )
+}
+```
+
+```{r}
+# Combine and save results table
+results_df <- do.call(rbind, results)
+results_df <- results_df[order(results_df$rmse), ]
+
+cat("\n=== Grid Search Results (sorted by RMSE) ===\n")
+print(results_df)
+
+write.csv(results_df, file.path(tables_dir, "brms_grid_search_v2.csv"), row.names = FALSE)
+```
+
+### Training Additional Models with Interaction Terms
+```{r}
+# Re-load data if offline
+root <- find_root(has_file("pyproject.toml"))
+figures_dir <- file.path(root, "results", "figures") # to save plots for later
+tables_dir <- file.path(root, "results", "metrics") # to save tables
+models_dir <- file.path(root, "models") # to save serialized models for prediction time
+
+df <- read_parquet(file.path(root, "data", "processed", "bayesian_preprocessed_final.parquet"))
+
+# COVID col
+df <- df %>%
+  mutate(is_covid = as.integer(year == 2020))
+
+head(df)
+```
+```{r}
+# Training configs
+train <- df[df$year < 2024, ]
+test  <- df[df$year == 2024, ]
+
+ITERATIONS <- 1000
+WARMUP <- 500
+CHAINS <- 2
+CORES <- 4
+TRAINING_VERSION <- "v3"
+
+configs <- list(
+  list(prior_beta_sd = 1.0, prior_int_mean = 3.5, family = "negbinomial", iter = ITERATIONS, warmup = WARMUP),
+  list(prior_beta_sd = 0.5, prior_int_mean = 3.5, family = "negbinomial", iter = ITERATIONS, warmup = WARMUP),
+  list(prior_beta_sd = 1.0, prior_int_mean = 3.0, family = "negbinomial", iter = ITERATIONS, warmup = WARMUP),
+  list(prior_beta_sd = 1.0, prior_int_mean = 3.5, family = "poisson",     iter = ITERATIONS, warmup = WARMUP))
+```
+
+```{r}
+results <- list()
+
+# For each model, fit and evaluate the model
+for (i in seq_along(configs)) {
+  cfg <- configs[[i]]
+  cat(sprintf("\n--- Config %d/%d ---\n", i, length(configs)))
+  print(cfg)
+  
+  # Model name based on configuration
+  model_name <- sprintf(
+  "brms_beta%.1f_int%.1f_%s_iter%d_%s",
+  cfg$prior_beta_sd, cfg$prior_int_mean, cfg$family, cfg$iter, TRAINING_VERSION)
+  model_path <- file.path(models_dir, paste0(model_name, ".rds"))
+  
+  # Skip if model was already fit
+  if (file.exists(model_path)) {
+    cat("Already fitted, loading from disk...\n")
+    fit    <- readRDS(model_path)
+    timing <- NULL
+    
+  } else {
+    fam <- if (cfg$family == "negbinomial") negbinomial() else poisson()
+    
+    # Fit model if not already saved to disk
+    fit <- tryCatch({
+      timing <- system.time({
+        model <- brm(
+          formula = count ~ month + (day_of_week | neighborhood) + is_covid,
+          data    = train,
+          family  = fam,
+          prior   = c(
+            prior_string(paste0("normal(0, ", cfg$prior_beta_sd, ")"), class = "b"),
+            prior_string(paste0("normal(", cfg$prior_int_mean, ", 1)"), class = "Intercept")
+          ),
+          chains  = CHAINS,
+          iter    = cfg$iter,
+          warmup  = cfg$warmup,
+          cores   = CORES,
+          seed    = 42,
+          silent  = 2,
+          refresh = 0
+        )
+      })
+      cat(sprintf("Training time: %.1f minutes\n", timing["elapsed"] / 60))
+      model
+    }, error = function(e) {
+      cat("FAILED:", e$message, "\n")
+      return(NULL)
+    })
+    
+    if (!is.null(fit)) {
+      saveRDS(fit, model_path)
+      cat("Saved:", model_path, "\n")
+    }
+  }
+  
+  if (is.null(fit)) next
+  
+  # Predictions using posterior predictive distribution
+  pred_samples <- posterior_predict(fit, newdata = test)
+  predicted    <- colMeans(pred_samples)
+  actual       <- test$count
+  
+  # Standard regression metrics
+  mae      <- mean(abs(predicted - actual))
+  rmse     <- sqrt(mean((predicted - actual)^2))
+  mape     <- mean(abs((actual - predicted) / actual)) * 100
+
+  
+  # Bayesian coverage — % of actuals within 95% credible interval
+  lower    <- apply(pred_samples, 2, quantile, 0.025)
+  upper    <- apply(pred_samples, 2, quantile, 0.975)
+  coverage <- mean(actual >= lower & actual <= upper) * 100
+  
+  # WAIC and LOO
+  waic_val <- tryCatch(waic(fit)$estimates["waic", "Estimate"], error = function(e) NA)
+  loo_val  <- tryCatch(loo(fit)$estimates["looic",  "Estimate"], error = function(e) NA)
+  
+  cat(sprintf("MAE:      %.2f\n",   mae))
+  cat(sprintf("RMSE:     %.2f\n",   rmse))
+  cat(sprintf("MAPE:     %.2f%%\n", mape))
+  cat(sprintf("Coverage: %.1f%% (95%% CI)\n", coverage))
+  cat(sprintf("WAIC:     %.2f\n",   waic_val))
+  cat(sprintf("LOO-IC:   %.2f\n",   loo_val))
+  
+  # Store results
+  results[[i]] <- data.frame(
+    model_name     = model_name,
+    prior_beta_sd  = cfg$prior_beta_sd,
+    prior_int_mean = cfg$prior_int_mean,
+    family         = cfg$family,
+    iter           = cfg$iter,
+    warmup         = cfg$warmup,
+    train_time_min = ifelse(is.null(timing), NA, round(timing["elapsed"] / 60, 2)),
+    mae            = round(mae,      2),
+    rmse           = round(rmse,     2),
+    mape           = round(mape,     2),
+    coverage       = round(coverage, 2),
+    waic           = round(waic_val, 2),
+    loo_ic         = round(loo_val,  2)
+  )
+}
+```
+
+```{r}
+# Combine and save results table
+results_df <- do.call(rbind, results)
+results_df <- results_df[order(results_df$rmse), ]
+
+cat("\n=== Grid Search Results (sorted by RMSE) ===\n")
+print(results_df)
+
+write.csv(results_df, file.path(tables_dir, "brms_grid_search_v3.csv"), row.names = FALSE)
+```
+
