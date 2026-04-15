@@ -1,1 +1,0 @@
-// Placeholder: ServiceTypeSelector component
