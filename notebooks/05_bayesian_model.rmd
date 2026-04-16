@@ -300,7 +300,7 @@ head(df)
 ```{r}
 # Added feature engineering:
 
-# 1. Add lag features (1 day lag, 1 week lag, 1 month lag)
+# 1. Add lag features (1 day lag, 1 week lag)
 df <- df %>%
   arrange(neighborhood, year, month, day_of_week) %>%
   group_by(neighborhood) %>%
@@ -454,7 +454,7 @@ print(results_df)
 write.csv(results_df, file.path(tables_dir, "brms_grid_search_v2.csv"), row.names = FALSE)
 ```
 
-### Training Additional Models with Interaction Terms
+### Training Additional Models with Interaction Terms (V3)
 ```{r}
 # Re-load data if offline
 root <- find_root(has_file("pyproject.toml"))
